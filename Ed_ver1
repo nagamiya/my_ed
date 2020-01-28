@@ -1,0 +1,335 @@
+#!/usr/bin/ruby
+
+require 'delegate'
+#コマンドラインのオプションを扱うクラス
+#OptionParserオブジェクトの生成、ブロック登録、parseするの段階が必要
+require 'optparse'
+
+
+class Ed_ver1 DelegateClass(Array)
+    @@address_re = '(?:\.|\$|\d+|\/.*\/|\?.*\?)'
+    #@@address_expression_re = '(?:(?:[-+]|#{@@address_re})+)'
+    @@command_re = '(?:wq|[acdfgijnpqw=]|\z)'
+    @@parameter_re = '(?:\s*.+)'    
+    @@command_list = {
+        'a' => :append_cmnd,
+        'c' => :change_cmnd,
+        'd' => :delete_cmnd,
+        'i' => :insert_cmnd,
+        'j' => :join_cmnd,
+        'n' => :print_cmnd,
+        'p' => :print_cmnd,
+        'q' => :quit_cmnd,
+        'w' => :write_cmnd,
+        '=' => :line_cmnd,
+        'wq' => :write_quit_cmnd,
+        '' => :set_cmnd,
+    }
+    @@command_list.default = :error_cmnd
+
+    def initialize
+        #super([])
+        @filename = ARGV[2]
+        File.open(@filename, mode = "rt") { |f|
+            @buffer = f.readlines
+        }
+        #@buffer = ARGF.readlines
+        @current = 0
+        @last = @buffer.length
+        @commands = ""
+        @message = ""
+        @prompt =  '> '
+        @begin_address = @current
+        @end_address = @current
+
+        #オブジェクト生成
+        opts = OptionParser.new
+        #-pが使われたときのブロック
+        opts.on '-p prompt' do |v|
+            @prompt = v
+        end
+        #perseする
+        opts.parse!(ARGV)
+
+        begin
+            self.concat(ARGF.readlines)
+            p self.reduce(0) {|s, l| s + l.bytesize}
+            @last = @current = self.length
+        rescue
+            puts $!.to_s
+        end
+
+        loop {
+            read
+            eval
+            print
+        }
+    end
+
+    def read
+        Kernel.print @prompt
+        @command = STDIN.gets.chomp
+    end
+
+    def eval
+        unless @command =~ /\A(#{@@address_re})?(,)?(?:(#{@@address_re}))?(#{@@command_re})\s*(#{@@parameter_re})?\z/
+            @message = "?"
+            return
+        end
+
+        #アドレス、カンマ、アドレス、コマンド、パラメータ
+        addr1, comma, addr2, cmnd, prmt = $1, $2, $3, $4, $5 
+        p [addr1, comma, addr2, cmnd, prmt] 
+
+        #puts("#{@buffer} \n")
+        @begin_address = addr1.to_i - 1 if addr1.to_i > 0
+        @end_address = addr2.to_i - 1 if addr2.to_i > 0
+        address_pattern = address_checker(addr1, comma, addr2)
+        isCCmnd = false
+
+        if cmnd == 'a' then
+            add_buffer(address_pattern)
+        elsif cmnd == 'c' then
+            isCCmnd = true
+            delete_buffer(address_pattern)
+            insert_buffer(address_pattern, isCCmnd)
+        elsif cmnd == 'd' then
+            delete_buffer(address_pattern)
+        elsif cmnd == 'i' then
+            insert_buffer(address_pattern, isCCmnd)
+        elsif cmnd == 'j' then
+            linking_buffer(address_pattern)
+        elsif cmnd == 'n' then
+            print_with_number(address_pattern)
+        elsif cmnd == 'p' then
+            print_buffer(address_pattern)
+        elsif cmnd == 'q' then
+            quit_editor()
+        elsif cmnd == 'w' then
+            #ファイルに書き込みする
+            write_buffer()
+        elsif cmnd == '=' then
+            puts "#{@last + 1} line.  <最後の改行コードを含みます>"
+        elsif cmnd == 'wq' then
+            write_buffer()
+            quit_editor()
+        end
+    end
+
+    def print
+        puts @message
+        @message = ""
+    end
+
+    # アドレスの有無次第でbuffer操作をするメソッドの動きが変わるので、予めまとめた
+    def address_checker(address1, comma, address2)
+        if address1 && comma && address2 then    # addr1,addr2（両方ある）
+            @current = @end_address
+            return 1
+        elsif address1 && comma then             # addr1,だけ
+            @current = @begin_address
+            return 2
+        elsif comma && address2 then             # ,addr2だけ
+            @current = @end_address
+            return 3
+        elsif address1 then                      # addr1だけ（カンマもないことに注意）
+            @current = @begin_address
+            return 4
+        elsif comma then                         # ,だけ
+            @current = @last.to_i - 1
+            return 5
+        else                                    # 何もなし
+            return 6
+        end   
+    end
+
+    #入力用 -> a
+    def add_buffer(address_pattern)
+        puts address_pattern
+        case address_pattern
+        when 1 then
+            add_insert_roop(@end_address + 1)
+        when 2 then                         # addr1,だけ addr1に追加
+            add_insert_roop(@begin_address + 1)
+        when 3 then                         # ,addr2だけ addr2に追加
+            add_insert_roop(@end_address + 1)
+        when 4 then                         # addr1だけ i2と同じ
+            add_insert_roop(@begin_address + 1)
+        when 5 then                         # ,だけ カレント行に追加
+            add_insert_roop(@current + 1)
+        when 6 then                         # 5と同じ
+            add_insert_roop(@current + 1)
+        else
+            puts "Address Error"
+        end
+    end
+
+    #削除用 -> d
+    def delete_buffer(address_pattern)
+        case address_pattern
+        when 1 then                         # addr1,addr2（両方ある）
+            delete_length = @end_address - @begin_address + 1
+            @buffer.slice!(@begin_address, delete_length)
+        when 2 then                         # addr1,だけ addr1のみ削除
+            @buffer.delete_at(@begin_address)
+        when 3 then                         # ,addr2だけ 最初からaddr2まで
+            delete_length = @end_address - @begin_address + 1
+            @buffer.slice!(0, delete_length)
+        when 4 then                         # addr1だけ（カンマもないことに注意） 2と同じ
+            @buffer.delete_at(@begin_address)
+        when 5 then                         # ,だけ 全消し
+            @buffer.slice!(0, @last + 1)
+        when 6 then                         # 何もなし カレント行削除
+            @buffer.slice!(@current, 1)
+        else
+            puts "Address Error"
+        end
+        @last = @buffer.length
+    end
+
+    #入力用 -> i
+    def insert_buffer(address_pattern, isCCmnd)
+        puts address_pattern
+        case address_pattern
+        when 1 then                         # addr2の方に挿入
+            if isCCmnd then
+                add_insert_roop(@begin_address)
+            else
+                add_insert_roop(@end_address)
+            end
+        when 2 then                         # addr1,だけ addr1に追加
+            add_insert_roop(@begin_address)
+        when 3 then                         # ,addr2だけ addr2に追加
+            if isCCmnd then
+                add_insert_roop(0)
+            else
+                add_insert_roop(@end_address)
+            end
+        when 4 then                         # addr1だけ i2と同じ
+            add_insert_roop(@begin_address)
+        when 5 then                         # ,だけ カレント行に追加
+            if isCCmnd then
+                add_insert_roop(0)
+            else
+                add_insert_roop(@current)
+            end
+        when 6 then                         # 5と同じ
+            add_insert_roop(@current)
+        else
+            puts "Address Error"
+        end
+    end
+
+    # a,iコマンド実行時に呼び出される
+    def add_insert_roop(begin_add)
+        while
+            stdin = gets.chomp
+            break if stdin == "."
+            @buffer.insert(begin_add, stdin)
+            @last += 1
+            begin_add += 1
+        end
+    end
+
+
+    # 行の連結 -> j
+    def linking_buffer(address_pattern)
+        task_address = 0
+
+        case address_pattern
+        when 1 then                         # addr1,addr2（両方ある）
+            linking_roop(@begin_address, @end_address-1)
+        when 3 then                         # ,addr2だけ 最初からaddr2まで連結
+            linking_roop(0, @end_address-1)
+        when 5 then                         # ,だけ 全レンkrつ
+            linking_roop(0, @last-2)
+        else
+            puts "Address Error"
+        end
+        @last = @buffer.length
+    end
+
+    # jこまんどの時に呼び出される関数
+    def linking_roop(begin_add, end_add)
+        task_address = @begin_address
+        (begin_add..end_add).each do |idx|
+            @buffer[task_address].chomp!
+            @buffer[task_address] = @buffer[task_address] << @buffer[task_address + 1]
+            @buffer.delete_at(task_address + 1)
+        end
+    end
+
+
+    # 出力用 -> n
+    def print_with_number(address_pattern)
+        puts address_pattern
+        case address_pattern
+        when 1 then                         # addr1,addr2（両方ある）
+            (@begin_address..@end_address).each do |idx|
+                puts "#{idx+1}\t#{@buffer[idx]}"
+            end
+        when 2 then                         # addr1,だけ
+            puts "#{@begin_address+1}\t#{@buffer[@begin_address]}"
+        when 3 then                         # ,addr2だけ
+            (0..@end_address).each do |idx|
+                puts "#{idx+1}\t#{@buffer[idx]}"
+            end
+        when 4 then                         # addr1だけ（カンマもないことに注意）、もしかして2と変わらない？
+            puts "#{@begin_address+1}\t#{@buffer[@begin_address]}"
+        when 5 then                         # ,だけ
+            (0..@last).each do |idx|
+                puts "#{idx+1}\t#{@buffer[idx]}"
+            end
+        when 6 then                         # 何もなし
+            puts "#{@current + 1}\t#{@buffer[@current]}"
+        else
+            puts "Address Error"
+        end
+    end
+
+    # 出力用 -> p
+    def print_buffer(address_pattern)
+        case address_pattern
+        when 1 then                         # addr1,addr2（両方ある）
+            (@begin_address..@end_address).each do |idx|
+                puts "#{@buffer[idx]}"
+            end
+        when 2 then                         # addr1,だけ
+            puts "#{@buffer[@begin_address]}"
+        when 3 then                         # ,addr2だけ
+            (0..@end_address).each do |idx|
+                puts "#{@buffer[idx]}"
+            end
+        when 4 then                         # addr1だけ（カンマもないことに注意）、もしかして2と変わらない？
+            puts "#{@buffer[@begin_address]}"
+        when 5 then                         # ,だけ
+            (0..@last).each do |idx|
+                puts "#{@buffer[idx]}"
+            end
+        when 6 then                         # 何もなし
+            puts "#{@buffer[@current]}"
+        else
+            puts "Address Error"
+        end
+
+    end
+
+    # エディタ閉じる -> q
+    def quit_editor()
+        p ("---------close---------")
+        exit
+    end
+
+    # ファイル 書き込み -> w
+    def write_buffer()
+        File.open(@filename, mode = "w") { |f|
+            @buffer.each  do |b| 
+                f.puts(b)
+            end     
+        }
+        p ("---------writed---------")
+    end
+
+end
+
+Ed_ver1.new
